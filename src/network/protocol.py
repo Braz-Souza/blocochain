@@ -45,11 +45,11 @@ class Message:
 class Protocol:
     @staticmethod
     def new_transaction(tx_dict: dict, sender: str = "") -> Message:
-        return Message(type=MessageType.NEW_TRANSACTION, payload=tx_dict, sender=sender)
+        return Message(type=MessageType.NEW_TRANSACTION, payload={"transaction": tx_dict}, sender=sender)
 
     @staticmethod
     def new_block(block_dict: dict, sender: str = "") -> Message:
-        return Message(type=MessageType.NEW_BLOCK, payload=block_dict, sender=sender)
+        return Message(type=MessageType.NEW_BLOCK, payload={"block": block_dict}, sender=sender)
 
     @staticmethod
     def request_chain(sender: str = "") -> Message:
@@ -57,7 +57,7 @@ class Protocol:
 
     @staticmethod
     def response_chain(chain_dict: dict, sender: str = "") -> Message:
-        return Message(type=MessageType.RESPONSE_CHAIN, payload=chain_dict, sender=sender)
+        return Message(type=MessageType.RESPONSE_CHAIN, payload={"blockchain": chain_dict}, sender=sender)
 
     @staticmethod
     def ping(sender: str = "") -> Message:

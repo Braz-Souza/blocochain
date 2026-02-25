@@ -120,8 +120,7 @@ def menu_peers(node: Node):
         print("  (nenhum)")
         return
     for peer in sorted(node.peers):
-        failures = node._peer_failures.get(peer, 0)
-        print(f"  {peer}  (falhas: {failures})")
+        print(f"  {peer}")
 
 
 def menu_connect_peer(node: Node):

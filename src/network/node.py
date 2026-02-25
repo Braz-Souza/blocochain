@@ -12,7 +12,6 @@ from .protocol import Message, MessageType, Protocol
 
 logger = logging.getLogger(__name__)
 
-MAX_PEER_FAILURES = 3
 SOCKET_TIMEOUT = 5.0
 RECV_BUFFER = 4096
 SYNC_INTERVAL = 2.0
@@ -38,7 +37,6 @@ class Node:
         self.miner = Miner(self.blockchain, self.address)
 
         self.peers: Set[str] = set()
-        self._peer_failures: dict = {}
         self._mining_thread: Optional[threading.Thread] = None
         self._server_sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
@@ -128,7 +126,7 @@ class Node:
 
     def _on_new_transaction(self, msg: Message) -> None:
         try:
-            tx = Transaction.from_dict(msg.payload)
+            tx = Transaction.from_dict(msg.payload["transaction"])
             added = self.blockchain.add_transaction(tx, trusted=False)
             if added:
                 logger.info("Nova transação recebida: %s", tx.id[:8])
@@ -142,7 +140,7 @@ class Node:
 
     def _on_new_block(self, msg: Message) -> None:
         try:
-            block = Block.from_dict(msg.payload)
+            block = Block.from_dict(msg.payload["block"])
             self.miner.stop()
             added = self.blockchain.add_block(block)
             if added:
@@ -158,11 +156,14 @@ class Node:
         return None
 
     def _on_request_chain(self, msg: Message) -> Message:
+        if msg.sender and msg.sender != self.address:
+            with self._lock:
+                self._add_peer(msg.sender)
         return Protocol.response_chain(self.blockchain.to_dict(), sender=self.address)
 
     def _on_response_chain(self, msg: Message) -> None:
         try:
-            bc = Blockchain.from_dict(msg.payload)
+            bc = Blockchain.from_dict(msg.payload["blockchain"])
             replaced = self.blockchain.replace_chain(bc.chain)
             if replaced:
                 logger.info("Chain local substituída pela recebida de %s", msg.sender)
@@ -196,23 +197,16 @@ class Node:
                 sock.connect((host, port))
                 sock.sendall(msg.to_bytes())
                 if expect_response:
-                    header = _recv_exact(sock, 4)
-                    msg_len = struct.unpack(">I", header)[0]
-                    body = _recv_exact(sock, msg_len)
-                    response = Message.from_bytes(body)
-                    with self._lock:
-                        self._peer_failures[peer] = 0
-                    return response
-                with self._lock:
-                    self._peer_failures[peer] = 0
+                    try:
+                        header = _recv_exact(sock, 4)
+                        msg_len = struct.unpack(">I", header)[0]
+                        body = _recv_exact(sock, msg_len)
+                        return Message.from_bytes(body)
+                    except Exception:
+                        return None
                 return None
         except Exception as e:
             logger.debug("Falha ao enviar para %s: %s", peer, e)
-            with self._lock:
-                self._peer_failures[peer] = self._peer_failures.get(peer, 0) + 1
-                if self._peer_failures[peer] >= MAX_PEER_FAILURES:
-                    self.peers.discard(peer)
-                    logger.warning("Peer %s removido após %d falhas", peer, MAX_PEER_FAILURES)
             return None
 
     def _broadcast(self, msg: Message, exclude: set = None):
@@ -230,19 +224,43 @@ class Node:
     def connect_to_peer(self, peer: str):
         if peer == self.address:
             return
-        response = self._send_message(peer, Protocol.ping(sender=self.address), expect_response=True)
-        if response and response.type == MessageType.PONG:
-            with self._lock:
-                self._add_peer(peer)
-            logger.info("Peer conectado: %s", peer)
 
-            resp2 = self._send_message(
-                peer, Protocol.discover_peers(sender=self.address), expect_response=True
-            )
-            if resp2 and resp2.type == MessageType.PEERS_LIST:
-                self._on_peers_list(resp2)
-        else:
+        host, port_str = peer.rsplit(":", 1)
+        port = int(port_str)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(SOCKET_TIMEOUT)
+                sock.connect((host, port))
+
+                msg = Protocol.request_chain(sender=self.address)
+                sock.sendall(msg.to_bytes())
+
+                response = None
+                try:
+                    header = _recv_exact(sock, 4)
+                    msg_len = struct.unpack(">I", header)[0]
+                    body = _recv_exact(sock, msg_len)
+                    response = Message.from_bytes(body)
+                except Exception:
+                    pass
+
+        except Exception as e:
             logger.warning("Não foi possível conectar ao peer: %s", peer)
+            return
+
+        with self._lock:
+            self._add_peer(peer)
+        logger.info("Peer conectado: %s", peer)
+
+        if response and response.type == MessageType.RESPONSE_CHAIN:
+            self._on_response_chain(response)
+
+        # Descoberta de peers
+        resp2 = self._send_message(
+            peer, Protocol.discover_peers(sender=self.address), expect_response=True
+        )
+        if resp2 and resp2.type == MessageType.PEERS_LIST:
+            self._on_peers_list(resp2)
 
     def sync_blockchain(self):
         with self._lock:
@@ -260,7 +278,7 @@ class Node:
             )
             if response and response.type == MessageType.RESPONSE_CHAIN:
                 try:
-                    bc = Blockchain.from_dict(response.payload)
+                    bc = Blockchain.from_dict(response.payload["blockchain"])
                     if (
                         len(bc.chain) > len(best_chain)
                         and self.blockchain.is_valid_chain(bc.chain)
